@@ -7,6 +7,8 @@ import pulp
 import os
 import sys
 import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 @contextlib.contextmanager
 def suppress_stdout_stderr():
@@ -21,71 +23,67 @@ def suppress_stdout_stderr():
             sys.stderr = old_stderr
 
 # === Configurações ===
-MODEL_PATH = "mlp_mnist.nnet"
+MODEL_PATH = "mlp_mnist_robust.nnet"
 IMG_SIZE = 28
+EPSILON = 0.01
+DELTA = 0.005
+MAX_WORKERS = 8
 
 # === 1. Carregar imagem e label ===
 (_, _), (x_test, y_test) = mnist.load_data()
-image = x_test[0] / 255.0  # normalizado
+image = x_test[0] / 255.0
 true_label = int(y_test[0])
 
-def run_marabou(image_flat, label, epsilon=0.01):
-    net = Marabou.read_nnet(MODEL_PATH)
-    input_vars = net.inputVars[0].flatten()
-    output_vars = net.outputVars[0].flatten()
+def is_classification_different_by_freedom(image_flat, label, free_index, epsilon=EPSILON, delta=DELTA):
+    v = image_flat[free_index]
+    lower = max(0.0, v - delta)
+    upper = min(1.0, v + delta)
+    if lower == upper:
+        return False
 
-    # Fixar entrada
-    for i in range(len(input_vars)):
-        net.setLowerBound(input_vars[i], image_flat[i])
-        net.setUpperBound(input_vars[i], image_flat[i])
+    for target in range(10):
+        if target == label:
+            continue
+        with suppress_stdout_stderr():
+            net = Marabou.read_nnet(MODEL_PATH)
+            input_vars = net.inputVars[0].flatten()
+            output_vars = net.outputVars[0].flatten()
+            for i in range(len(input_vars)):
+                if i == free_index:
+                    net.setLowerBound(input_vars[i], lower)
+                    net.setUpperBound(input_vars[i], upper)
+                else:
+                    net.setLowerBound(input_vars[i], image_flat[i])
+                    net.setUpperBound(input_vars[i], image_flat[i])
+            net.addInequality([output_vars[target], output_vars[label]], [1, -1], -epsilon)
+            status, _, _ = net.solve(verbose=False)
+            if status == 'sat':
+                return True
+    return False
 
-    # Impor que a saída esperada (label) tenha valor maior que todas as outras
-    # for i in range(len(output_vars)):
-    #     if i != label:
-    #         net.addInequality(
-    #             [output_vars[label], output_vars[i]],  # f_label - f_i >= ε
-    #             [1, -1],
-    #             -epsilon  # f_label - f_i ≥ ε  =>  f_label - f_i + (-ε) ≥ 0
-    #         )
-    
-    # 2. Impor restrição: output[label] ≥ output[i ≠ label]
-    for i in range(10):
-        if i != label:
-            net.addInequality([output_vars[i], output_vars[label]], [1, -1], 0)
-
-    # Resolver
-    status, vals, _ = net.solve(verbose=False)
-
-    return {
-        "status": status,
-        "vals": vals,
-    }
-
-
+def run_marabou(image_flat, label, epsilon=EPSILON, delta=DELTA):
+    return {'status': 'sat' if any(
+        is_classification_different_by_freedom(image_flat, label, i, epsilon, delta)
+        for i in range(len(image_flat))
+    ) else 'unsat'}
 
 def run_explanation(image, label): 
     sense_image = image.copy()
     image = image.flatten()
-    
+
     def minimum_vertex_cover_milp(pairs):
-        # 1. Obter todos os vértices únicos
         vertices = sorted(set([v for edge in pairs for v in edge]))
-        # 2. Variáveis binárias: x[i] = 1 se o vértice i está na cobertura
         x = pulp.LpVariable.dicts("x", vertices, 0, 1, pulp.LpBinary)
-        # 3. Problema de minimização
         prob = pulp.LpProblem("MinimumVertexCover", pulp.LpMinimize)
-        # 4. Função objetivo: minimizar o número de vértices na cobertura
         prob += pulp.lpSum([x[v] for v in vertices])
-        # 5. Restrições: para cada aresta (u, v), pelo menos um dos vértices deve estar no conjunto
         for u, v in pairs:
             prob += x[u] + x[v] >= 1, f"cover_{u}_{v}"
-        # 6. Resolver
         prob.solve(pulp.PULP_CBC_CMD(msg=False))
-        # 7. Extrair solução
         vertex_cover = {v for v in vertices if pulp.value(x[v]) >= 0.99}
         return vertex_cover
 
-    def sort_by_sensibility(model='mlp_mnist.h5', image=image, label=label):
+    def sort_by_sensibility(model_path='mlp_mnist_robust.h5', image=sense_image, label=label):
+        model = tf.keras.models.load_model(model_path)
         with tf.GradientTape() as tape:
             input_tensor = tf.convert_to_tensor(image[None, ...])
             tape.watch(input_tensor)
@@ -95,69 +93,75 @@ def run_explanation(image, label):
         flat_grads = np.abs(grads).flatten()
         return np.argsort(flat_grads)[::-1] 
 
-    ub, lb = len(image), 0
+    ub = len(image)
     free = []
+    ub_lock = threading.Lock()
 
-    def upper_bound(sorted_features_idx, image=image, label=label-1 if label>0 else label+1): 
-        nonlocal ub
-        nonlocal free
-        F = sorted_features_idx.copy()
-        for f in F:
-            candidate_explanation = image.copy()
-            if len(free) > 0:
-                for freed_pixels in free:
-                    candidate_explanation[freed_pixels] = np.random.uniform(0.0, 1.0)
-            candidate_explanation[f] = np.random.uniform(0.0, 1.0)
-            result = run_marabou(candidate_explanation, label)
-            if result['status'] == 'unsat':
-                free.append(f)
-                ub -= 1
-                print('=-'*50)
-                print(free)
-                exit()
+    def upper_bound(sorted_features_idx, image=image, label=label): 
+        nonlocal ub, free
+        def test_pixel(f):
+            if not is_classification_different_by_freedom(image, label, f, EPSILON, DELTA):
+                with ub_lock:
+                    free.append(f)
+                    ub_dec = 1
+                    return ub_dec
+            return 0
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(test_pixel, f) for f in sorted_features_idx]
+            for future in as_completed(futures):
+                ub -= future.result()
         return ub
-                
-    def lower_bound(image=image, label=label-1 if label>0 else label+1):
+
+    lb = 0
+    lb_lock = threading.Lock()
+
+    def lower_bound(image=image, label=label):
         nonlocal lb
         singletons = []
         pairs = []
-        
-        # Contrastive Singletons
+
         F = image.copy()
-        for f_idx in range(len(F)):
+
+        def test_singleton(f_idx):
             altered_F = F.copy()
-            altered_F[f_idx] = np.random.uniform(0.0, 1.0)
-            result_cs = run_marabou(altered_F, label)
-            if result_cs['status'] == 'sat':
-                singletons.append(f_idx)
-                lb += 1
-        
-        # All Contrastive Pairs
+            altered_F[f_idx] = np.clip(altered_F[f_idx] + np.random.uniform(-DELTA, DELTA), 0.0, 1.0)
+            result = run_marabou(altered_F, label, EPSILON, DELTA)
+            if result['status'] == 'sat':
+                with lb_lock:
+                    singletons.append(f_idx)
+                    lb_inc = 1
+                    return lb_inc
+            return 0
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(test_singleton, i) for i in range(len(F))]
+            for future in as_completed(futures):
+                lb += future.result()
+
         candidates = [i for i in np.arange(len(F)) if i not in singletons]
         all_pairs = list(combinations(candidates, 2))
         for pair in all_pairs:
             altered_F = F.copy()
-            altered_F[pair[0]] = np.random.uniform(0.0, 0.1)
-            altered_F[pair[1]] = np.random.uniform(0.0, 0.1)
-            result_cp = run_marabou(altered_F, label)
+            altered_F[pair[0]] = np.clip(altered_F[pair[0]] + np.random.uniform(-DELTA, DELTA), 0.0, 1.0)
+            altered_F[pair[1]] = np.clip(altered_F[pair[1]] + np.random.uniform(-DELTA, DELTA), 0.0, 1.0)
+            result_cp = run_marabou(altered_F, label, EPSILON, DELTA)
             if result_cp['status'] == 'sat':
                 pairs.append(pair)
-                
+
         mvc = minimum_vertex_cover_milp(pairs)
         lb += len(mvc)
         return lb
-    
+
     sort_f = sort_by_sensibility()
     upb = upper_bound(sorted_features_idx=sort_f)
     lob = lower_bound()
     return [image[i] for i in np.arange(len(image)) if i not in free], upb, lob
 
-# exp, u, l = run_explanation(image, true_label)
-# print('Explanation len:', len(exp))
-# print('Explanation:', exp)
-# print(f'UB = {u} | LB = {l} | CORRECTNESS = {u/l if l>0 else 0}')
-
+# Executar
 with suppress_stdout_stderr():
-    res = run_marabou(image.flatten(), true_label, 0)
-    
-print(res['status'])
+    exp, u, l = run_explanation(image, true_label)
+
+print('Explanation len:', len(exp))
+print('Explanation:', exp)
+print(f'UB = {u} | LB = {l} | APPROXIMATION = {u/l if l>0 else 0:.2f}')

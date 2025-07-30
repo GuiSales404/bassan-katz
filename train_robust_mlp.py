@@ -1,9 +1,12 @@
+import tensorflow as tf
+from tensorflow.keras.datasets import mnist
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Flatten, Dropout
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.callbacks import EarlyStopping
+import numpy as np
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Flatten
-from tensorflow.keras.datasets import mnist
-import numpy as np
 
 def writeNNet(weights, biases, inputMins, inputMaxes, means, ranges, fileName):
     '''
@@ -52,19 +55,44 @@ def writeNNet(weights, biases, inputMins, inputMaxes, means, ranges, fileName):
     except Exception as e:
         print(f"Error writing NNet file: {e}")
         raise
-# 1. Treina o modelo
-(x_train, y_train), _ = mnist.load_data()
-x_train = x_train.astype(np.float32) / 255.0
-y_train = tf.keras.utils.to_categorical(y_train, 10)
 
+
+# 1. Carregamento dos dados
+(x_train, y_train), (x_test, y_test) = mnist.load_data()
+x_train = x_train.astype("float32") / 255.0
+x_test = x_test.astype("float32") / 255.0
+
+# 2. Construção do modelo MLP
 model = Sequential([
     Flatten(input_shape=(28, 28)),
-    Dense(30, activation='relu'),
-    Dense(10, activation='relu'),
-    Dense(10, activation='softmax')
+    Dense(64, activation='relu', kernel_regularizer=l2(1e-4)),
+    Dropout(0.3),
+    Dense(32, activation='relu', kernel_regularizer=l2(1e-4)),
+    Dense(16, activation='relu', kernel_regularizer=l2(1e-4)),
+    Dense(10, activation='linear')  # importante: saída linear para Marabou
 ])
-model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-model.fit(x_train, y_train, epochs=5, batch_size=128)
+
+# 3. Compilação
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+    loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    metrics=["accuracy"]
+)
+
+# 4. Treinamento com EarlyStopping
+model.fit(
+    x_train, y_train,
+    epochs=50,
+    batch_size=128,
+    validation_split=0.1,
+    callbacks=[EarlyStopping(patience=3, restore_best_weights=True)],
+    verbose=2
+)
+
+# 5. Avaliação final
+test_loss, test_acc = model.evaluate(x_test, y_test, verbose=0)
+print(f"\n✅ Test Accuracy: {test_acc:.4f}")
+
 
 # 2. Extrai pesos e bias
 params = model.get_weights()
@@ -80,8 +108,7 @@ means = [0.0] * input_size + [0.0]  # +1 para output
 ranges = [1.0] * input_size + [1.0]
 
 # 4. Escreve .nnet
-writeNNet(weights, biases, input_mins, input_maxes, means, ranges, "mlp_mnist.nnet")
+writeNNet(weights, biases, input_mins, input_maxes, means, ranges, "mlp_mnist_robust.nnet")
 
-# 5. Salva o modelo Keras
-model.save("mlp_mnist.h5")
-print("Modelo treinado e salvo como 'mlp_mnist.nnet' e 'mlp_mnist.h5'.")
+# 6. Salvar modelo Keras
+model.save("mlp_mnist_robust.h5")
