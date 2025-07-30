@@ -1,0 +1,2 @@
+image_idx,label,UB,LB,approximation,image_path,block_size,delta
+0,7,784,784,1.00,exp_results/mask_img0_block1_delta0.0005.npy,1,0.0005

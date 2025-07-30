@@ -82,8 +82,8 @@ def run_explanation(image, label):
         vertex_cover = {v for v in vertices if pulp.value(x[v]) >= 0.99}
         return vertex_cover
 
-    def sort_by_sensibility(model_path='mlp_mnist_robust.h5', image=sense_image, label=label):
-        model = tf.keras.models.load_model(model_path)
+    def sort_by_sensibility(model_path='mlp_mnist.h5', image=sense_image, label=label):
+        model = tf.keras.models.load_model(model_path, compile=False)   
         with tf.GradientTape() as tape:
             input_tensor = tf.convert_to_tensor(image[None, ...])
             tape.watch(input_tensor)

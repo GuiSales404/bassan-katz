@@ -16,8 +16,8 @@ import pandas as pd
 MODEL_PATH = "mlp_mnist.nnet"
 IMG_SIZE = 28
 EPSILON = 0.01
-DELTA_VALUES = [0.0005, 0.005, 0.05]
-BLOCK_SIZES = [1, 4, 7, 14]
+DELTA_VALUES = [0.0005, 0.05]
+BLOCK_SIZES = [1, 7, 14]
 IMAGE_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # Exemplo de índices de imagens
 MAX_WORKERS = 8
 RESULTS_DIR = "exp_results"
@@ -36,6 +36,25 @@ def suppress_stdout_stderr():
             sys.stderr = old_stderr
 
 # === Funções Utilitárias ===
+
+def sort_blocks_by_sensibility(model_path='mlp_mnist.h5', image=None, label=None, block_indices=None):
+    model = tf.keras.models.load_model(model_path)
+    image_tensor = tf.convert_to_tensor(image[None, ...])
+    with tf.GradientTape() as tape:
+        tape.watch(image_tensor)
+        prediction = model(image_tensor)
+        logit = prediction[0, label]
+    grads = tape.gradient(logit, image_tensor).numpy()[0]
+    flat_grads = np.abs(grads).flatten()
+
+    block_scores = []
+    for idx, pixels in enumerate(block_indices):
+        score = sum(flat_grads[p] for p in pixels)
+        block_scores.append((idx, score))
+    sorted_indices = [idx for idx, _ in sorted(block_scores, key=lambda x: -x[1])]
+    return sorted_indices
+
+
 def get_blocks(image, block_size):
     blocks = []
     indices = []
@@ -110,7 +129,8 @@ def minimum_vertex_cover_milp(pairs):
 
 
 # === Função central de explicação ===
-def run_upper_bound(image_flat, label, epsilon, delta, blocks, block_indices, max_workers=8):
+# 🔁 Modifique a função run_upper_bound para receber ordem
+def run_upper_bound(image_flat, label, epsilon, delta, blocks, block_indices, max_workers=8, sorted_block_order=None):
     ub = len(blocks)
     free_blocks = []
     ub_lock = threading.Lock()
@@ -126,11 +146,13 @@ def run_upper_bound(image_flat, label, epsilon, delta, blocks, block_indices, ma
             return 1
         return 0
 
+    order = sorted_block_order or range(len(blocks))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(test_block, i) for i in range(len(blocks))]
+        futures = [executor.submit(test_block, i) for i in order]
         for future in as_completed(futures):
             ub -= future.result()
     return ub, free_blocks
+
 
 def run_lower_bound(image_flat, label, epsilon, delta, blocks, block_indices, max_workers=8):
     lb = 0
